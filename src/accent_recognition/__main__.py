@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+from torch.cuda.amp import autocast, GradScaler
 from datasets import load_from_disk, Audio
 from sklearn.metrics import accuracy_score, f1_score
 from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
@@ -92,16 +93,25 @@ class FeatureCollator:
         return batch_feats, lengths, batch_labels
 
 class AudioCollator:
-    def __init__(self, feature_extractor):
+    def __init__(self, feature_extractor, max_seconds=4.0, train_crop=False):
         self.feat_extractor = feature_extractor
         self.sr = feature_extractor.sampling_rate
+        self.max_len = int(max_seconds * self.sr)
+        self.train_crop = train_crop
 
-        # Some extractors default to not returning it; force-enable if supported.
         if hasattr(self.feat_extractor, "return_attention_mask"):
             self.feat_extractor.return_attention_mask = True
 
+    def _trim(self, x):
+        if len(x) <= self.max_len:
+            return x
+        if self.train_crop:
+            start = random.randint(0, len(x) - self.max_len)
+            return x[start:start + self.max_len]
+        return x[:self.max_len]
+
     def __call__(self, batch):
-        audio_list = [ex["audio"]["array"] for ex in batch]
+        audio_list = [self._trim(ex["audio"]["array"]) for ex in batch]
         labels = torch.tensor([ex["accent"] for ex in batch], dtype=torch.long)
 
         inputs = self.feat_extractor(
@@ -109,18 +119,16 @@ class AudioCollator:
             sampling_rate=self.sr,
             padding=True,
             return_tensors="pt",
-            return_attention_mask=True,  # <- critical
+            return_attention_mask=True,
         )
 
         input_values = inputs["input_values"]
         attention_mask = inputs.get("attention_mask", None)
-
-        # If it's *still* missing, just treat everything as valid (no padding mask).
-        # Not ideal, but prevents crashing and still trains.
         if attention_mask is None:
-            attention_mask = torch.ones(input_values.shape, dtype=torch.long)
+            attention_mask = torch.ones_like(input_values, dtype=torch.long)
 
         return input_values, attention_mask, labels
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -136,6 +144,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate for optimizer.")
     parser.add_argument("--output_dir", type=str, default="accent_model_output", help="Directory to save logs and models.")
+    parser.add_argument("--max_seconds", type=float, default=4.0)
+    parser.add_argument("--train_crop", action="store_true", help="random crop during training")
+    parser.add_argument("--fp16", action="store_true", help="use mixed precision (CUDA only)")
+    parser.add_argument("--grad_accum", type=int, default=1, help="gradient accumulation steps")
+    parser.add_argument("--freeze_backbone", action="store_true",
+                    help="freeze pretrained encoder and train only classifier head")
+    parser.add_argument("--unfreeze_last_n", type=int, default=0,
+                        help="if >0, unfreeze last N transformer layers (still freeze rest)")
     args = parser.parse_args()
     
     # Create output directory
@@ -195,7 +211,37 @@ def main():
             label2id=label2id,
             id2label=id2label
         )
-        collator = AudioCollator(feature_extractor)
+        if args.freeze_backbone:
+            # Freeze everything first
+            for p in hf_model.parameters():
+                p.requires_grad = False
+
+            head_modules = []
+            for name in ["classifier", "projector"]:
+                if hasattr(hf_model, name):
+                    head_modules.append(getattr(hf_model, name))
+
+            if not head_modules:
+                raise RuntimeError("Couldn't find classifier/projector modules to unfreeze.")
+
+            for m in head_modules:
+                for p in m.parameters():
+                    p.requires_grad = True
+
+            # Optionally unfreeze last N transformer layers for a small amount of adaptation
+            if args.unfreeze_last_n > 0:
+                base = getattr(hf_model, "wav2vec2", None) or getattr(hf_model, "wavlm", None)
+                if base is None:
+                    # AutoModel wrapper sometimes stores it under .wav2vec2 even for wavlm-class models,
+                    # but keep this explicit and fail loudly if unknown.
+                    raise RuntimeError("Couldn't locate base model (wav2vec2/wavlm) to unfreeze layers.")
+
+                enc_layers = base.encoder.layers
+                n = args.unfreeze_last_n
+                for layer in enc_layers[-n:]:
+                    for p in layer.parameters():
+                        p.requires_grad = True
+        collator = AudioCollator(feature_extractor, max_seconds=args.max_seconds, train_crop=True)
         # If feature_extractor has normalization, it will be applied in collator
     
     # Use GPU if available
@@ -206,9 +252,12 @@ def main():
         custom_model.to(device)
     # Setup optimizer
     if hf_model:
-        optimizer = torch.optim.AdamW(hf_model.parameters(), lr=args.lr)
+        trainable_params = [p for p in hf_model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
     else:
         optimizer = torch.optim.Adam(custom_model.parameters(), lr=(args.lr if args.lr else 1e-3))
+    use_amp = args.fp16 and (device.type == "cuda")
+    scaler = GradScaler(enabled=use_amp)
     
     # Setup loss function
     if args.weighted_loss:
@@ -241,25 +290,39 @@ def main():
         if custom_model: custom_model.train()
         total_loss = 0.0
         for batch in train_loader:
-            optimizer.zero_grad()
-            if hf_model:
-                input_values, attention_mask, labels = batch
-                input_values = input_values.to(device)
-                attention_mask = attention_mask.to(device)
-                labels = labels.to(device)
-                # Forward pass
-                outputs = hf_model(input_values=input_values, attention_mask=attention_mask)
-                logits = outputs.logits  # shape (B, num_labels)
-            else:
-                features, lengths, labels = batch
-                features = features.to(device)
-                labels = labels.to(device)
-                # lengths is a list of python ints; sort by length if needed (enforce_sorted handled in collator)
-                logits = custom_model(features, lengths)
-            # Compute loss
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
+
+            optimizer.zero_grad(set_to_none=True)
+
+            for step, batch in enumerate(train_loader):
+                if hf_model:
+                    input_values, attention_mask, labels = batch
+                    input_values = input_values.to(device, non_blocking=True)
+                    attention_mask = attention_mask.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
+                else:
+                    features, lengths, labels = batch
+                    features = features.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
+
+                with autocast(enabled=use_amp):
+                    if hf_model:
+                        outputs = hf_model(input_values=input_values, attention_mask=attention_mask)
+                        logits = outputs.logits
+                    else:
+                        logits = custom_model(features, lengths)
+
+                    loss = criterion(logits, labels)
+                    loss = loss / args.grad_accum
+
+                scaler.scale(loss).backward()
+
+                if (step + 1) % args.grad_accum == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
+                total_loss += loss.item() * args.grad_accum
+
             total_loss += loss.item()
         avg_train_loss = total_loss / len(train_loader)
         
